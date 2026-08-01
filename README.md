@@ -11,6 +11,19 @@ BookCraft 是一个将英文 EPUB 电子书或 Markdown 文件一键翻译成中
 - **富文本保留**：保留原文的链接、加粗、图片等 DOM 结构，对照排版美观；
 - **两种翻译类型**：`bilingual`（中英对照，默认）/ `chinese_only`（仅中文，标题保留英文）
 
+## 效果展示
+
+<table>
+  <tr>
+    <td align="center"><b>原版（英文）</b></td>
+    <td align="center"><b>中英对照</b></td>
+  </tr>
+  <tr>
+    <td><img src="docs/images/original.png" alt="原版英文" width="400"></td>
+    <td><img src="docs/images/bilingual.png" alt="中英对照" width="400"></td>
+  </tr>
+</table>
+
 ## 安装
 
 ### 环境要求
@@ -18,7 +31,7 @@ BookCraft 是一个将英文 EPUB 电子书或 Markdown 文件一键翻译成中
 - Python ≥ 3.9
 - 一个支持 Skill 的 AI Agent 运行环境（如 Claude Code、Codex、OpenCode、Zcode等）
 
-### 快捷安装（让 AI 助手代劳）
+### 1. 快捷安装（让 AI 助手代劳）
 
 最省事的方式——把下面这句话发给你的 AI 助手，它会自动下载、安装并配置依赖：
 
@@ -32,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/pf711-dev/BookCraft-Skill/main/inst
 
 安装脚本会自动：复制 BookCraft 到 `~/.agents/skills/BookCraft` → 安装 Python 依赖 → 验证环境。
 
-### 手动安装
+### 2. 手动安装
 
 如果你想自己控制每一步：
 
@@ -50,7 +63,7 @@ curl -fsSL https://raw.githubusercontent.com/pf711-dev/BookCraft-Skill/main/inst
 
 3. 首次使用时，Agent 会自动检查依赖是否就绪。
 
-## 🚀 使用
+## 使用
 
 安装完成后，直接在支持 Skill 的 AI 助手对话里发起翻译请求即可，无需手动调用脚本：
 
@@ -62,7 +75,6 @@ curl -fsSL https://raw.githubusercontent.com/pf711-dev/BookCraft-Skill/main/inst
 
 Agent 会自动：提取段落 → 翻译术语表 → 分批翻译正文 → 组装最终文件，并告知你输出路径。
 
-> 💡 不使用 Skill 框架？`scripts/translate.py` 也可独立运行。它提供 `extract`（提取段落到 JSON）和 `build`（把翻译结果组装回原格式）两个子命令，中间的翻译步骤你可以接入任意模型。详见脚本头部文档。
 
 ### 手动术语表（可选）
 
@@ -80,13 +92,13 @@ Agent 会自动：提取段落 → 翻译术语表 → 分批翻译正文 → �
 
 
 
-## ⚠️ 边界
+## 边界
 
 - 只翻译**英文 → 中文**，不支持其他语言对
 - 只处理 **EPUB 和 Markdown** 两种格式
 - 不做 OCR，不处理扫描版 PDF（如需翻译 PDF，请先转换为 EPUB）
 - 翻译质量取决于驱动模型的翻译能力，不提供人工审校
 
-## 📄 许可证
+## 许可证
 
 [MIT](LICENSE)
