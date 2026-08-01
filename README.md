@@ -1,6 +1,6 @@
 # BookCraft
 
-BookCraft 是一个将英文 EPUB 电子书或 Markdown 文件一键翻译成中英对照或纯中文格式的 skill。
+BookCraft 是一个将英文 EPUB 电子书或 Markdown 文件一键翻译成中英对照或纯中文格式的 Skill。
 
 
 ## 功能
@@ -26,12 +26,12 @@ BookCraft 是一个将英文 EPUB 电子书或 Markdown 文件一键翻译成中
 
 ## 安装
 
-### 环境要求
+### 1. 环境要求
 
 - Python ≥ 3.9
-- 一个支持 Skill 的 AI Agent 运行环境（如 Claude Code、Codex、OpenCode、Zcode等）
+- 一个支持 Skill 的 AI Agent 运行环境（如 Claude Code、Codex、OpenCode、Zcode 等）
 
-### 1. 快捷安装（让 AI 助手代劳）
+### 2. 快捷安装（让 AI 助手代劳）
 
 最省事的方式——把下面这句话发给你的 AI 助手，它会自动下载、安装并配置依赖：
 
@@ -45,7 +45,7 @@ curl -fsSL https://raw.githubusercontent.com/pf711-dev/BookCraft-Skill/main/inst
 
 安装脚本会自动：复制 BookCraft 到 `~/.agents/skills/BookCraft` → 安装 Python 依赖 → 验证环境。
 
-### 2. 手动安装
+### 3. 手动安装
 
 如果你想自己控制每一步：
 
