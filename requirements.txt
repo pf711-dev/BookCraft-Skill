@@ -1,0 +1,9 @@
+# BookCraft 依赖
+# 安装：pip3 install -r requirements.txt
+
+# 必需：EPUB/Markdown 解析
+beautifulsoup4>=4.12
+lxml>=4.9
+
+# 可选：Markdown 解析（未安装时自动回退到内置简易解析器）
+mistune>=3.0
