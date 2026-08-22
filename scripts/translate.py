@@ -181,7 +181,7 @@ def _segment_has_media(nodes: list) -> bool:
     for node in nodes:
         if hasattr(node, 'name') and node.name in MEDIA_TAGS:
             return True
-        if hasattr(node, 'find') and node.find(MEDIA_TAGS):
+        if hasattr(node, 'find') and node.find(list(MEDIA_TAGS)):
             return True
     return False
 
@@ -319,10 +319,16 @@ def write_back_chapter(cd: ChapterData, translations: list[str],
             continue
         is_h = anchor.name in HEADING_TAGS
         if is_h:
-            # 标题：保留英文标题，紧随其后插入中文（多子段时拼接所有翻译）
+            # 标题：多子段时拼接所有翻译
             zh = ' '.join(z.strip() for z in zh_slice if z and z.strip())
             if zh.strip():
-                anchor.insert_after(build_dom_chinese_div(soup, zh, 'chinese-title'))
+                if translate_type == 'chinese_only':
+                    # 仅中文：标题内容直接替换为中文（保留标题标签，沿用原书标题样式）
+                    anchor.clear()
+                    anchor.string = zh
+                else:
+                    # 双语：保留英文标题，紧随其后插入中文
+                    anchor.insert_after(build_dom_chinese_div(soup, zh, 'chinese-title'))
         elif anchor.name in ('blockquote', 'li', 'td', 'th', 'figcaption', 'caption', 'dt', 'dd'):
             # 引用/列表项/表格单元格/图注等：保留外壳，内部重建为对照块
             blocks = build_dom_translated_blocks(soup, seg_nodes, seg_texts, zh_slice, translate_type)
@@ -500,8 +506,13 @@ def extract_markdown_paragraphs(file_path: str) -> dict:
 
 
 def build_bilingual_markdown(original_md: str, paragraphs: list[dict],
-                              translations: list[str]) -> str:
-    """构建中英对照 Markdown（按逻辑块匹配，鲁棒支持多行段落/列表/链接）"""
+                              translations: list[str],
+                              translate_type: str = "bilingual") -> str:
+    """构建翻译后的 Markdown（按逻辑块匹配，鲁棒支持多行段落/列表/链接）
+
+    - bilingual：中英对照，中文以 `>` 引用块附在原文之后
+    - chinese_only：整块替换为中文（标题保留 # 前缀，列表项保留列表符号）
+    """
     lines = original_md.split('\n')
     result_lines = []
     para_idx = 0
@@ -514,6 +525,23 @@ def build_bilingual_markdown(original_md: str, paragraphs: list[dict],
                 result_lines.append('')
                 result_lines.append(f'> 🇨🇳 {translations[idx]}')
                 result_lines.append('')
+
+    def emit_block(idx, block_lines):
+        """输出一个已匹配的逻辑块"""
+        if translate_type != 'chinese_only':
+            result_lines.extend(block_lines)
+            emit_translation(idx)
+            return
+        zh = translations[idx].strip() if idx < len(translations) else ''
+        if not zh:
+            result_lines.extend(block_lines)  # 无译文：保留原文，避免内容丢失
+            return
+        # 单行标题块：保留 # 前缀；其余块整体替换为中文
+        m = re.match(r'^(#{1,6})\s+', block_lines[0]) if block_lines else None
+        if (len(block_lines) == 1 and paragraphs[idx]['is_heading'] and m):
+            result_lines.append(f"{m.group(1)} {zh}")
+        else:
+            result_lines.append(zh)
 
     while i < n:
         line = lines[i]
@@ -557,8 +585,7 @@ def build_bilingual_markdown(original_md: str, paragraphs: list[dict],
         if para_idx < len(paragraphs):
             para_norm = _normalize_text(html_module.unescape(paragraphs[para_idx]['text']))
             if normalized and para_norm and normalized == para_norm:
-                result_lines.extend(block_lines)
-                emit_translation(para_idx)
+                emit_block(para_idx, block_lines)
                 para_idx += 1
                 result_lines.extend([''] * blank)
                 continue
@@ -575,8 +602,14 @@ def build_bilingual_markdown(original_md: str, paragraphs: list[dict],
             if (para_idx < len(paragraphs)
                     and item_norm
                     and item_norm == _normalize_text(html_module.unescape(paragraphs[para_idx]['text']))):
-                result_lines.append(bl)
-                emit_translation(para_idx)
+                zh_item = translations[para_idx].strip() if para_idx < len(translations) else ''
+                pm = re.match(r'^(\s*)([\-\*\+]|\d+[\.\)])\s+', bl)
+                if translate_type == 'chinese_only' and zh_item and pm:
+                    # 仅中文：保留缩进与列表符号，替换为中文
+                    result_lines.append(f"{pm.group(1)}{pm.group(2)} {zh_item}")
+                else:
+                    result_lines.append(bl)
+                    emit_translation(para_idx)
                 para_idx += 1
             else:
                 result_lines.append(bl)
@@ -904,6 +937,11 @@ def run_build(args):
         _build_markdown(meta, translations, workdir)
 
 
+def _output_suffix(translate_type: str) -> str:
+    """按翻译类型生成输出文件后缀"""
+    return '_chinese_only' if translate_type == 'chinese_only' else '_bilingual'
+
+
 def _build_epub(meta, translations, workdir: Path):
     """组装 EPUB"""
     epub_extract_path = workdir / "epub"
@@ -923,7 +961,7 @@ def _build_epub(meta, translations, workdir: Path):
     output_path = meta.get('output', '')
     if not output_path:
         input_path = Path(meta['input'])
-        output_path = str(input_path.parent / f"{input_path.stem}_bilingual{input_path.suffix}")
+        output_path = str(input_path.parent / f"{input_path.stem}{_output_suffix(translate_type)}{input_path.suffix}")
     pack_epub(epub_extract_path, output_path)
     print(f"\n✅ 翻译完成: {output_path}", flush=True)
 
@@ -936,12 +974,14 @@ def _build_markdown(meta, translations, workdir: Path):
     with open(workdir / 'paragraph_details.json', 'r', encoding='utf-8') as f:
         paragraphs = json.load(f)
 
-    result_md = build_bilingual_markdown(original_md, paragraphs, translations)
+    translate_type = meta.get('translate_type', 'bilingual')
+    result_md = build_bilingual_markdown(original_md, paragraphs, translations,
+                                         translate_type=translate_type)
 
     output_path = meta.get('output', '')
     if not output_path:
         input_path = Path(meta['input'])
-        output_path = str(input_path.parent / f"{input_path.stem}_bilingual.md")
+        output_path = str(input_path.parent / f"{input_path.stem}{_output_suffix(translate_type)}.md")
 
     with open(output_path, 'w', encoding='utf-8') as f:
         f.write(result_md)
@@ -977,7 +1017,8 @@ def main():
             args.workdir = tempfile.mkdtemp(prefix='bilingual_')
         if not args.output:
             ext = Path(args.input).suffix
-            args.output = str(Path(args.input).parent / f"{Path(args.input).stem}_bilingual{ext}")
+            suffix = _output_suffix(args.type)
+            args.output = str(Path(args.input).parent / f"{Path(args.input).stem}{suffix}{ext}")
         run_extract(args)
     elif args.action == 'build':
         run_build(args)
