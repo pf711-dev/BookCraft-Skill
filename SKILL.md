@@ -1,5 +1,6 @@
 ---
 name: bookcraft
+version: 1.2.0
 description: |
   双语翻译工具（BookCraft）：将英文 EPUB、Markdown 或 PDF 翻译成中英对照或仅中文版本。
   触发条件：用户说"翻译"、"双语翻译"、"中英对照"、"translate"、
