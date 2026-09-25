@@ -178,10 +178,13 @@ def split_container_segments(container) -> tuple:
 
 def _segment_has_media(nodes: list) -> bool:
     """判断段内是否包含媒体节点（图片/公式等）"""
+    from bs4 import Tag
     for node in nodes:
-        if hasattr(node, 'name') and node.name in MEDIA_TAGS:
+        if not isinstance(node, Tag):
+            continue
+        if node.name in MEDIA_TAGS:
             return True
-        if hasattr(node, 'find') and node.find(list(MEDIA_TAGS)):
+        if node.find(list(MEDIA_TAGS)):
             return True
     return False
 
@@ -797,10 +800,12 @@ def detect_file_type(input_path: str) -> str:
     ext = Path(input_path).suffix.lower()
     if ext == '.epub':
         return 'epub'
+    elif ext == '.pdf':
+        return 'pdf'
     elif ext in ('.md', '.markdown'):
         return 'markdown'
     else:
-        raise ValueError(f"不支持的文件类型: {ext}，仅支持 .epub 和 .md")
+        raise ValueError(f"不支持的文件类型: {ext}，仅支持 .epub / .md / .pdf")
 
 
 def run_extract(args):
@@ -811,8 +816,27 @@ def run_extract(args):
 
     if file_type == 'epub':
         _extract_epub(args, workdir)
+    elif file_type == 'pdf':
+        _extract_pdf(args, workdir)
     else:
         _extract_markdown(args, workdir)
+
+
+def _extract_pdf(args, workdir: Path):
+    """提取 PDF（结构化提取层：章节/图片/扫描页/verbatim）"""
+    try:
+        from pdf_extract import extract_pdf
+    except ImportError as e:
+        raise SystemExit(f"PDF 支持需要 PyMuPDF：pip3 install pymupdf ({e})")
+    extract_pdf(
+        input_path=args.input, workdir=str(workdir),
+        chapters_mode=getattr(args, 'chapters', 'auto'),
+        chapter_pattern=getattr(args, 'chapter_pattern', None),
+        heading_delta=getattr(args, 'heading_delta', 2.0),
+        scan_min_chars=getattr(args, 'scan_min_chars', 20),
+        translate_type=args.type,
+        output=str(args.output) if args.output else '',
+    )
 
 
 def _extract_epub(args, workdir: Path):
@@ -933,8 +957,19 @@ def run_build(args):
 
     if file_type == 'epub':
         _build_epub(meta, translations, workdir)
+    elif file_type == 'pdf':
+        _build_pdf(meta, translations, workdir)
     else:
         _build_markdown(meta, translations, workdir)
+
+
+def _build_pdf(meta, translations, workdir: Path):
+    """组装 PDF 翻译结果（EPUB + Markdown）"""
+    try:
+        from pdf_build import build_pdf
+    except ImportError as e:
+        raise SystemExit(f"PDF 组装需要 ebooklib：pip3 install ebooklib ({e})")
+    build_pdf(meta, translations, workdir)
 
 
 def _output_suffix(translate_type: str) -> str:
@@ -999,15 +1034,24 @@ def main():
 
     # extract 子命令
     p_extract = subparsers.add_parser('extract', help='提取段落到 JSON')
-    p_extract.add_argument('--input', required=True, help='输入文件路径（.epub 或 .md）')
+    p_extract.add_argument('--input', required=True, help='输入文件路径（.epub / .md / .pdf）')
     p_extract.add_argument('--workdir', help='工作目录（不传则自动创建临时目录）')
     p_extract.add_argument('--output', help='最终输出文件路径（可选）')
     p_extract.add_argument('--type', choices=['bilingual', 'chinese_only'], default='bilingual',
                             help='翻译类型：bilingual（中英对照）或 chinese_only（仅中文），默认 bilingual')
+    # PDF 专用参数（其他类型忽略）
+    p_extract.add_argument('--chapters', choices=['auto', 'outline', 'heading', 'pattern'],
+                           default='auto', help='[PDF] 章节检测策略，默认 auto（有书签用 outline，否则 heading）')
+    p_extract.add_argument('--chapter-pattern', help='[PDF] 章节标题正则（--chapters pattern 时必需）')
+    p_extract.add_argument('--heading-delta', type=float, default=2.0,
+                           help='[PDF] 标题字号超出正文的差值，默认 2.0pt')
+    p_extract.add_argument('--scan-min-chars', type=int, default=20,
+                           help='[PDF] 整页文本少于该字符数判定为扫描页，默认 20')
+    p_extract.add_argument('--no-merge', action='store_true', help='[PDF] 禁用跨页段落合并')
 
     # build 子命令
     p_build = subparsers.add_parser('build', help='从翻译结果组装最终文件')
-    p_build.add_argument('--input', required=True, help='原始输入文件路径（.epub 或 .md）')
+    p_build.add_argument('--input', required=True, help='原始输入文件路径（.epub / .md / .pdf）')
     p_build.add_argument('--workdir', required=True, help='工作目录（需与 extract 时相同）')
 
     args = parser.parse_args()
@@ -1016,8 +1060,9 @@ def main():
         if not args.workdir:
             args.workdir = tempfile.mkdtemp(prefix='bilingual_')
         if not args.output:
-            ext = Path(args.input).suffix
             suffix = _output_suffix(args.type)
+            # PDF 输入输出为 EPUB；EPUB/Markdown 保持原格式后缀
+            ext = '.epub' if Path(args.input).suffix.lower() == '.pdf' else Path(args.input).suffix
             args.output = str(Path(args.input).parent / f"{Path(args.input).stem}{suffix}{ext}")
         run_extract(args)
     elif args.action == 'build':

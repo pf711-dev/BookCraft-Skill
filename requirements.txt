@@ -7,3 +7,7 @@ lxml>=4.9
 
 # 可选：Markdown 解析（未安装时自动回退到内置简易解析器）
 mistune>=3.0
+
+# 可选：PDF 翻译（仅处理 .pdf 输入时需要；提供结构化提取与 EPUB 组装）
+pymupdf>=1.24
+ebooklib>=0.18
