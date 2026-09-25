@@ -14,3 +14,6 @@ Thumbs.db
 .idea/
 .vscode/
 *.swp
+
+# Agent 本地备注（不上传）
+AGENTS.md
