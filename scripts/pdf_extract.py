@@ -149,18 +149,37 @@ def detect_headers_footers(doc, sample_pages=200):
 # 主提取
 # ============================================================
 
+# 数学符号（含 Greek 字符）：公式行检测。公式不该翻译（模型改写极易破坏），
+# 密度高的行直接 verbatim 保留原文（不做公式识别重建，扫描页识图兑底）
+MATH_CHARS_RE = re.compile(
+    r'[\u221a\u2211\u222b\u222e\u220f\u00b1\u2264\u2265\u2260\u2248\u2261\u221e\u2202\u2207\u2206\u00d7\u00f7\u2208\u2209\u2282\u2283\u222a\u2229\u22a5\u2220\u00b5\u00b0\u2032\u2033'
+    r'\u0391-\u03c9\u03d0-\u03ff]')
+
+
+def math_symbol_count(text):
+    return len(MATH_CHARS_RE.findall(text))
+
+
 def is_verbatim(text):
-    """信头地址/电话/纯数据表行 → 保留原文不翻译"""
+    """信头地址/电话/纯数据表行/公式行 → 保留原文不翻译"""
     t = text.strip()
     if len(t) <= 2:
         return True
     if PHONE_RE.search(t) and len(t) < 150:
         return True
     toks = t.split()
-    if len(toks) > 4:
+    if len(toks) >= 3:
         numish = sum(1 for x in toks if re.fullmatch(r'[\d.,%()$+-]+|[AU]?\$[\d.,bnm]*', x))
         if numish / len(toks) > 0.45:
             return True
+    # 公式行：数学符号 >=3 个，或 >=2 个且密度 >=8%（避免正文偶现 "≤ 5 days" 误伤）
+    math_n = math_symbol_count(t)
+    if math_n >= 3 or (math_n >= 2 and math_n / max(1, len(t)) >= 0.08):
+        return True
+    # 字体映射乱码兑底：PyMuPDF 对无 ToUnicode 映射的公式字形成片输出 U+00B7（·），
+    # 密集 · 是乱码公式/符号行的典型特征，原样保护避免模型对乱码再创作
+    if t.count('·') >= 3:
+        return True
     return False
 
 
@@ -270,13 +289,15 @@ def extract_pdf(input_path: str, workdir: str, chapters_mode: str = 'auto',
         print(f"⚠️  {scan_count}/{doc.page_count} 页为扫描页——这是扫描版书籍。\n"
               f"   整本识图翻译不现实，建议先用 OCR 工具转文本后再运行本流程。", file=sys.stderr)
 
-    # 4. 跨页段落合并
+    # 4. 跨页段落合并（排除 verbatim 候选块：数据行不与表头/正文行拼接，
+    #    否则表头被数据行吞进同一块后整块 verbatim，表头就进不了翻译流）
     if not no_merge:
         for ch in chapters:
             merged = []
             for blk in ch["blocks"]:
                 if (blk["t"] == "p" and merged and merged[-1]["t"] == "p"
-                        and not blk.get("heading") and not merged[-1].get("heading")):
+                        and not blk.get("heading") and not merged[-1].get("heading")
+                        and not is_verbatim(blk["text"]) and not is_verbatim(merged[-1]["text"])):
                     prev = merged[-1]["text"]
                     if prev and prev[-1] not in '.!?:;”"\')' and blk["text"][:1].islower():
                         merged[-1]["text"] = prev + " " + blk["text"]

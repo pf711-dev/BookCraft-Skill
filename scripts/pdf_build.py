@@ -126,8 +126,11 @@ def build_pdf(meta, translations, workdir):
         title = chmeta["title_en"]
         html = [f"<h1>{esc(title)}</h1>"]
         md = [f"\n---\n\n## {title}\n"]
+        skip_until = -1  # 连续 verbatim 聚合后跳过已消费块（索引不动，保 pid 稳定）
         for idx, blk in enumerate(ch["blocks"]):
             pid = f"{ch['id']}:{idx}"
+            if idx < skip_until:
+                continue
             if blk["t"] == "p":
                 if blk.get("heading"):
                     zh = pid2zh.get(pid)
@@ -136,8 +139,17 @@ def build_pdf(meta, translations, workdir):
                         md[-1] = f"\n---\n\n## {zh}\n"
                     continue
                 if blk.get("verbatim"):
-                    html.append(f"<div class='table-verbatim'>{esc(blk['text'])}</div>")
-                    md.append(f"```\n{blk['text']}\n```\n")
+                    # 连续 verbatim 块（数据表多行/公式组）聚合为一个整体，视觉完整
+                    parts = [blk["text"]]
+                    j = idx + 1
+                    while (j < len(ch["blocks"]) and ch["blocks"][j]["t"] == "p"
+                           and ch["blocks"][j].get("verbatim")):
+                        parts.append(ch["blocks"][j]["text"])
+                        j += 1
+                    skip_until = j
+                    joined = "\n".join(parts)
+                    html.append(f"<div class='table-verbatim'>{esc(joined)}</div>")
+                    md.append(f"```\n{joined}\n```\n")
                     continue
                 zh = pid2zh.get(pid)
                 if bilingual:

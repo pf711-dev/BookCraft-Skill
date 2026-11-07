@@ -571,13 +571,295 @@ def pack_epub(source_path: Path, output_path: str):
 
 
 # ============================================================
-# Markdown 操作
+# Markdown 公式保护：$...$ / $$...$$ / \(...\) / \[...\] → ⟦Mn⟧ 占位符
+#
+# 数学公式不该翻译（模型改写极易破坏表达式），必须在 MD 原文层
+# 替换为占位符穿越翻译批次，写回前还原。
+# 注意：mistune 无 math 插件，HTML 层公式只是普通文本，所以保护
+# 必须在 mistune 转换之前做。
 # ============================================================
 
+PLACEHOLDER_FMT = '⟦M{n}⟧'
+# 严格占位符（我们生成的形态）
+PLACEHOLDER_RE = re.compile(r'⟦\s*[Mm]\s*(\d+)\s*⟧')
+# 宽容还原：容忍翻译模型把括号写成全角/方括号、增删空白、改大小写
+PLACEHOLDER_TOLERANT_RE = re.compile(r'[⟦【\[]\s*[Mm]\s*(\d+)\s*[⟧】\]]')
+
+# 代码围栏 / 行内代码先挖出保管，防止其中的 $（如 shell 变量、价格示例）被误当公式
+CODE_FENCE_RE = re.compile(r'^([ \t]*)(`{3,}|~{3,})[^\n]*\n(?:.*?\n)?^\1\2[^\n]*$', re.M)
+INLINE_CODE_RE = re.compile(r'`[^`\n]+`')
+
+# LaTeX 定界符（最明确，优先识别）
+PAREN_MATH_RE = re.compile(r'\\\((.+?)\\\)', re.S)
+BRACKET_MATH_RE = re.compile(r'\\\[(.+?)\\\]', re.S)
+DISPLAY_MATH_RE = re.compile(r'\$\$(.+?)\$\$', re.S)
+# 行内 $...$ 采用类 pandoc 启发式避免货币误伤：
+#   开 $ 前不紧贴字母/数字/$，开 $ 后非空白；闭 $ 前非空白，闭 $ 后不紧贴字母/数字。
+#   "costs $100 and $200" 不匹配（闭 $ 前是空格）；"$E = mc^2$" 匹配。
+INLINE_MATH_RE = re.compile(r'(?<!\\)(?<![\w$])\$([^\s$](?:[^$\n]*?[^\s$])?)\$(?![\w$])')
+
+
+def protect_formulas(md_content: str) -> tuple[str, dict]:
+    """MD 原文层公式保护：识别数学公式并替换为 ⟦Mn⟧ 占位符。
+
+    返回 (保护后 MD, {序号: 公式原文含定界符})。保护后的 MD 用于
+    mistune 转换、段落提取与写回匹配；公式原文存 formulas.json，
+    build 时由 restore_formulas 统一还原。
+    """
+    formulas: dict[int, str] = {}
+    stash: list[str] = []
+
+    def _keep(m):
+        stash.append(m.group(0))
+        return f'\x00K{len(stash) - 1}\x00'
+
+    protected = CODE_FENCE_RE.sub(_keep, md_content)
+    protected = INLINE_CODE_RE.sub(_keep, protected)
+
+    def _make_repl(pattern):
+        def _repl(m):
+            idx = len(formulas) + 1
+            formulas[idx] = m.group(0)
+            return PLACEHOLDER_FMT.format(n=idx)
+        return lambda s: pattern.sub(_repl, s)
+
+    for pattern in (PAREN_MATH_RE, BRACKET_MATH_RE, DISPLAY_MATH_RE, INLINE_MATH_RE):
+        protected = _make_repl(pattern)(protected)
+
+    # 还原代码块/行内代码
+    def _unkeep(m):
+        i = int(m.group(1))
+        return stash[i] if i < len(stash) else m.group(0)
+
+    protected = re.sub(r'\x00K(\d+)\x00', _unkeep, protected)
+    return protected, formulas
+
+
+def restore_formulas(text: str, formulas: dict) -> str:
+    """宽容还原 ⟦Mn⟧ 占位符为公式原文（容忍括号变体/空白/大小写差异）。
+
+    引用行（> 前缀）内的块级公式还原为多行时，续行自动补引用前缀，
+    避免公式撑破 bilingual 译文引用块结构。
+    """
+    if not formulas:
+        return text
+
+    def _repl(m):
+        # JSON 读回后 key 为字符串，protect 时为 int，双形态兼容
+        formula = formulas.get(m.group(1)) or formulas.get(int(m.group(1)))
+        if not formula:
+            return m.group(0)
+        # 替换点是否位于引用行：看行首到替换点之间的前缀
+        line_start = text.rfind('\n', 0, m.start()) + 1
+        if text[line_start:m.start()].lstrip().startswith('>'):
+            formula = formula.replace('\n', '\n> ')
+        return formula
+
+    return PLACEHOLDER_TOLERANT_RE.sub(_repl, text)
+
+
+def _translation_valid(src_text: str, translation: str) -> bool:
+    """公式占位符完整性校验：原文含 ⟦Mn⟧，译文必须同样齐全（容忍形态差异）。
+
+    缺失视为译文无效（模型吞掉/改写了公式）——调用方回退英文原文，防公式丢失。
+    """
+    need = {int(n) for n in PLACEHOLDER_RE.findall(src_text or '')}
+    if not need:
+        return True
+    got = {int(n) for n in PLACEHOLDER_TOLERANT_RE.findall(translation or '')}
+    return need <= got
+
+
+# ============================================================
+# Markdown 表格：整表作为一个翻译单元（表头 + 各行）
+#
+# 整表粒度保证列语义（如 "Q1" 知道是季度列）；写回时按单元格
+# 重建 | 结构，解析失败 / 列数不匹配 / 占位符缺失 → 整表回退英文。
+# ============================================================
+
+MD_TABLE_SEP_RE = re.compile(r'^\s*\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$')
+HAS_LETTER_RE = re.compile(r'[A-Za-z]')
+
+
+def _is_table_block(block_lines: list[str]) -> bool:
+    """逻辑块是否为 Markdown 表格：含对齐行（|---|---|）且多数行含 |"""
+    nonempty = [l for l in block_lines if l.strip()]
+    if len(nonempty) < 2:
+        return False
+    has_sep = any(MD_TABLE_SEP_RE.match(l) for l in nonempty)
+    pipes = sum(1 for l in nonempty if '|' in l)
+    return has_sep and pipes >= len(nonempty) - 1
+
+
+def _split_md_row(line: str) -> list[str]:
+    """表格行 → 单元格列表（处理反斜杠转义的竖线）"""
+    s = line.strip()
+    if s.startswith('|'):
+        s = s[1:]
+    if s.endswith('|') and not s.endswith('\\|'):
+        s = s[:-1]
+    s = s.replace('\\|', '\x00')
+    return [c.strip().replace('\x00', '|') for c in s.split('|')]
+
+
+def _join_md_row(cells: list[str]) -> str:
+    """单元格列表 → 表格行（单元格内竖线转义为反斜杠竖线）"""
+    escaped = [c.replace('|', '\\|') for c in cells]
+    return '| ' + ' | '.join(escaped) + ' |'
+
+
+def _extract_table_unit(table_elem) -> dict | None:
+    """HTML <table> → 结构化翻译单元；无可译文字（全数字/空表）返回 None。"""
+    header: list[str] = []
+    rows: list[list[str]] = []
+    thead = table_elem.find('thead')
+    if thead:
+        for tr in thead.find_all('tr'):
+            header = [c.get_text(' ', strip=True) for c in tr.find_all(['th', 'td'])]
+    tbody = table_elem.find('tbody') or table_elem
+    first_body_row_is_header = False
+    for tr in tbody.find_all('tr'):
+        if thead and tr.find_parent('thead'):
+            continue
+        cells = [c.get_text(' ', strip=True) for c in tr.find_all(['th', 'td'])]
+        if not cells:
+            continue
+        if not thead and not rows and not header and all(c.name == 'th' for c in tr.find_all(['th', 'td'])):
+            header = cells  # 无 thead 时首行全 th 视为表头
+            continue
+        rows.append(cells)
+    if not header and not rows:
+        return None
+    texts = list(header) + [c for row in rows for c in row]
+    if not any(HAS_LETTER_RE.search(t) for t in texts):
+        return None  # 纯数字/符号表：翻译无增益，跳过
+    return {'header': header, 'rows': rows}
+
+
+def serialize_table_unit(unit: dict) -> str:
+    """表格单元 → 翻译文本（结构化多行，Agent 按格式返回逐格译文）"""
+    esc = lambda s: s.replace('|', '\\|')
+    lines = ['[TABLE]']
+    if unit['header']:
+        lines.append('Header: ' + ' | '.join(esc(c) for c in unit['header']))
+    for row in unit['rows']:
+        lines.append('Row: ' + ' | '.join(esc(c) for c in row))
+    return '\n'.join(lines)
+
+
+def _parse_table_translation(text: str, n_cols: int):
+    """宽容解析表格译文：Header:/Row: 前缀可缺省（退化为纯 | 行）。
+
+    返回 (header|None, rows|None)。整体解析失败（无任何行列数匹配）
+    返回 (None, None)，调用方整表回退英文。
+    """
+    header, rows = None, []
+    raw = [l.strip() for l in (text or '').strip().splitlines() if l.strip()]
+    pending: list[list[str]] = []
+    for l in raw:
+        if l.upper().startswith('[TABLE'):
+            continue
+
+        def _cells(s):
+            # 先保护 \| 转义再按 | 切分，否则含转义竖线的单元格被错位拆开
+            return [c.strip().replace('\x00', '|') for c in s.replace('\\|', '\x00').split('|')]
+
+        m = re.match(r'^(?:Header|表头)\s*[::]\s*(.+)$', l, re.I)
+        if m:
+            header = _cells(m.group(1))
+            continue
+        m = re.match(r'^(?:Row|数据行|行)\s*[::]\s*(.+)$', l, re.I)
+        if m:
+            pending.append(_cells(m.group(1)))
+            continue
+        pending.append(_cells(l))
+
+    def _cols_ok(cells):
+        return len(cells) == n_cols
+
+    if header is not None and _cols_ok(header):
+        good_rows = [r for r in pending if _cols_ok(r)]
+        return header, good_rows
+    # 无有效 Header：行全部匹配也可用（表头回退原文）
+    if pending and all(_cols_ok(r) for r in pending):
+        return None, pending
+    return None, None
+
+
+def _rebuild_zh_table(header, rows) -> list[str]:
+    """用译文单元格重建 Markdown 表格（含对齐行）"""
+    n_cols = len(header) if header else (len(rows[0]) if rows else 0)
+    lines = []
+    if header:
+        lines.append(_join_md_row(header))
+        lines.append('|' + ' --- |' * n_cols)
+    lines.extend(_join_md_row(r) for r in rows)
+    return lines
+
+
+def _translate_md_table(block_lines: list[str], unit: dict, zh_translation: str,
+                        translate_type: str):
+    """表格块写回：单元格替换为译文，重建保持 | 结构。
+
+    返回输出行列表；译文不可用（解析失败/占位符缺失）时整表回退英文。
+    bilingual 模式输出原表 + 中文表；chinese_only 模式仅输出中文表。
+    """
+    unit_table = unit.get('table') or {}
+    unit_header = unit_table.get('header') or []
+    unit_rows = unit_table.get('rows') or []
+    n_cols = len(unit_header) if unit_header else (len(unit_rows[0]) if unit_rows else 0)
+    if n_cols == 0:
+        return None
+
+    zh_header, zh_rows = None, None
+    if zh_translation:
+        if not _translation_valid(unit.get('text', ''), zh_translation):
+            zh_header, zh_rows = None, None  # 占位符缺失 → 回退英文
+        else:
+            zh_header, zh_rows = _parse_table_translation(zh_translation, n_cols)
+
+    # chinese_only：译文不可用 → None（调用方保留原表）；bilingual：至少输出原表
+    if translate_type == 'chinese_only' and not zh_header and not zh_rows:
+        return None
+
+    out: list[str] = []
+    if translate_type != 'chinese_only':
+        out.extend(block_lines)  # 原表
+        out.append('')
+        if zh_header or zh_rows:
+            out.extend(_rebuild_zh_table(zh_header, zh_rows))
+        else:
+            out.append(f'> 🇨🇳 （表格译文解析失败，保留原文）')
+        return out
+
+    # chinese_only：逐行替换单元格；行级不匹配保留该行原文
+    header_done = not unit_header
+    row_i = 0
+    for line in block_lines:
+        if MD_TABLE_SEP_RE.match(line):
+            out.append(line)
+            continue
+        if zh_rows is None and zh_header is None:
+            out.append(line)
+            continue
+        if not header_done and zh_header:
+            out.append(_join_md_row(zh_header) if len(zh_header) == n_cols else line)
+            header_done = True
+            continue
+        header_done = True
+        cur = zh_rows[row_i] if zh_rows and row_i < len(zh_rows) else None
+        row_i += 1
+        out.append(_join_md_row(cur) if (cur and len(cur) == n_cols) else line)
+    return out
+
+
 def extract_markdown_paragraphs(file_path: str) -> dict:
-    """从 Markdown 文件提取段落"""
+    """从 Markdown 文件提取段落（含公式保护与表格翻译单元）"""
     with open(file_path, 'r', encoding='utf-8') as f:
         md_content = f.read()
+
+    # 公式保护：mistune 转换前在原文层替换 $...$ 等为 ⟦Mn⟧ 占位符
+    md_content, formulas = protect_formulas(md_content)
 
     # Markdown → HTML
     if HAS_MISTUNE:
@@ -591,7 +873,25 @@ def extract_markdown_paragraphs(file_path: str) -> dict:
     body = soup.find('body')
 
     paragraphs = []
-    for elem in body.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'li']):
+    for elem in body.find_all(['p', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'blockquote', 'li', 'table']):
+        if elem.name == 'table':
+            # 整表作为一个翻译单元（表头+各行，保证列语义）
+            if elem.find_parent('table'):
+                continue  # 嵌套表防御：只取最外层
+            unit = _extract_table_unit(elem)
+            if unit:
+                paragraphs.append({
+                    'text': serialize_table_unit(unit),
+                    'is_heading': False,
+                    'tag': 'table',
+                    'type': 'table',
+                    'table': unit,
+                })
+            continue
+        if elem.find_parent('table'):
+            continue  # 表格内残存 p/li 不重复提取
+        if elem.name != 'blockquote' and elem.find_parent('blockquote'):
+            continue  # 引用块整体作为单元，内部 p/li 不重复提取（否则同文本双份入流）
         text = elem.get_text().strip()
         is_h = elem.name in HEADING_TAGS
         # 标题与正文统一按 >2 字符提取，避免短文本漏译（对齐 EPUB 处理）
@@ -601,21 +901,26 @@ def extract_markdown_paragraphs(file_path: str) -> dict:
                 'text': html_module.unescape(text),
                 'is_heading': is_h,
                 'tag': elem.name,
+                'type': 'text',
             })
 
     return {
         'paragraphs': paragraphs,
         'original_md': md_content,
+        'formulas': formulas,
     }
 
 
 def build_bilingual_markdown(original_md: str, paragraphs: list[dict],
                               translations: list[str],
-                              translate_type: str = "bilingual") -> str:
-    """构建翻译后的 Markdown（按逻辑块匹配，鲁棒支持多行段落/列表/链接）
+                              translate_type: str = "bilingual",
+                              formulas: dict | None = None) -> str:
+    """构建翻译后的 Markdown（按逻辑块匹配，鲁棒支持多行段落/列表/链接/表格）
 
-    - bilingual：中英对照，中文以 `>` 引用块附在原文之后
+    - bilingual：中英对照，中文以 `>` 引用块附在原文之后；表格附中文表副本
     - chinese_only：整块替换为中文（标题保留 # 前缀，列表项保留列表符号）
+    - formulas：⟦Mn⟧ → 公式原文映射；译文缺失占位符时该段回退英文，
+      输出前统一还原占位符为公式原文
     """
     lines = original_md.split('\n')
     result_lines = []
@@ -623,11 +928,25 @@ def build_bilingual_markdown(original_md: str, paragraphs: list[dict],
     n = len(lines)
     i = 0
 
+    def safe_translation(idx):
+        """译文有效性检查：非空 + 公式占位符齐全（缺失→返回空，回退原文）"""
+        if idx >= len(translations):
+            return ''
+        zh = translations[idx].strip()
+        if not zh:
+            return ''
+        if not _translation_valid(paragraphs[idx]['text'], zh):
+            return ''
+        return zh
+
     def emit_translation(idx):
         if idx < len(paragraphs) and not paragraphs[idx]['is_heading']:
-            if idx < len(translations) and translations[idx].strip():
+            zh = safe_translation(idx)
+            if zh:
                 result_lines.append('')
-                result_lines.append(f'> 🇨🇳 {translations[idx]}')
+                # 多行译文（如含还原后的块级公式）逐行加引用前缀，保持 Markdown 结构
+                result_lines.extend(f'> 🇨🇳 {ln}' if j == 0 else f'> {ln}'
+                                    for j, ln in enumerate(zh.split('\n')))
                 result_lines.append('')
 
     def emit_block(idx, block_lines):
@@ -636,7 +955,7 @@ def build_bilingual_markdown(original_md: str, paragraphs: list[dict],
             result_lines.extend(block_lines)
             emit_translation(idx)
             return
-        zh = translations[idx].strip() if idx < len(translations) else ''
+        zh = safe_translation(idx)
         if not zh:
             result_lines.extend(block_lines)  # 无译文：保留原文，避免内容丢失
             return
@@ -675,6 +994,22 @@ def build_bilingual_markdown(original_md: str, paragraphs: list[dict],
             result_lines.extend([''] * blank)
             continue
 
+        # 表格块：整表为一个翻译单元，单元格级替换（列数不匹配的行保留原文）
+        if _is_table_block(block_lines):
+            matched = False
+            if para_idx < len(paragraphs) and paragraphs[para_idx].get('type') == 'table':
+                zh = safe_translation(para_idx)
+                rebuilt = _translate_md_table(block_lines, paragraphs[para_idx], zh,
+                                              translate_type)
+                if rebuilt is not None:
+                    result_lines.extend(rebuilt)
+                    matched = True
+                para_idx += 1  # 无论译文可用与否，表格单元已消费，防止后续错位
+            if not matched:
+                result_lines.extend(block_lines)
+            result_lines.extend([''] * blank)
+            continue
+
         # 分隔线块跳过
         if len(block_lines) == 1 and block_lines[0].strip() in ('---', '***', '___'):
             result_lines.append(block_lines[0])
@@ -706,7 +1041,7 @@ def build_bilingual_markdown(original_md: str, paragraphs: list[dict],
             if (para_idx < len(paragraphs)
                     and item_norm
                     and item_norm == _normalize_text(html_module.unescape(paragraphs[para_idx]['text']))):
-                zh_item = translations[para_idx].strip() if para_idx < len(translations) else ''
+                zh_item = safe_translation(para_idx)
                 pm = re.match(r'^(\s*)([\-\*\+]|\d+[\.\)])\s+', bl)
                 if translate_type == 'chinese_only' and zh_item and pm:
                     # 仅中文：保留缩进与列表符号，替换为中文
@@ -719,7 +1054,10 @@ def build_bilingual_markdown(original_md: str, paragraphs: list[dict],
                 result_lines.append(bl)
         result_lines.extend([''] * blank)
 
-    return '\n'.join(result_lines)
+    result = '\n'.join(result_lines)
+    if formulas:
+        result = restore_formulas(result, formulas)
+    return result
 
 
 def _strip_inline_markdown(text: str) -> str:
@@ -738,8 +1076,8 @@ def _strip_inline_markdown(text: str) -> str:
 
 
 def _normalize_text(text: str) -> str:
-    """折叠空白，用于段落比对"""
-    return re.sub(r'\s+', ' ', text).strip()
+    """折叠空白，用于段落比对（同时统一 mistune 对 \\$ 的 unescape 差异）"""
+    return re.sub(r'\s+', ' ', text.replace('\\$', '$')).strip()
 
 
 def _md_to_html_fallback(md_content: str) -> str:
@@ -1029,9 +1367,12 @@ def _extract_markdown(args, workdir: Path):
             'original_md_file': str(workdir / 'original.md'),
         }, f, ensure_ascii=False, indent=2)
 
-    # 保存原始 Markdown
     with open(workdir / 'original.md', 'w', encoding='utf-8') as f:
         f.write(data['original_md'])
+
+    # 公式映射：⟦Mn⟧ → 公式原文（build 时还原）
+    with open(workdir / 'formulas.json', 'w', encoding='utf-8') as f:
+        json.dump({'formulas': data.get('formulas', {})}, f, ensure_ascii=False, indent=2)
 
     # 术语表候选：供 Agent 先翻译术语表，再逐批翻译段落时注入，保证人名/专有名词译名统一
     candidates = extract_glossary_candidates(paragraphs)
@@ -1046,10 +1387,13 @@ def _extract_markdown(args, workdir: Path):
         'status': 'extracted',
         'type': 'markdown',
         'total_paragraphs': len(paragraphs),
+        'formulas_protected': len(data.get('formulas', {})),
+        'table_units': sum(1 for p in data['paragraphs'] if p.get('type') == 'table'),
         'workdir': str(workdir),
         'paragraphs_file': str(workdir / 'paragraphs.json'),
         'glossary_candidates': len(candidates),
-        'next_step': 'Agent 先翻译术语表写入 glossary.json，再逐批翻译段落，结果写入 translations.json',
+        'next_step': 'Agent 先翻译术语表写入 glossary.json，再逐批翻译段落，结果写入 translations.json；'
+                     '⟦Mn⟧ 公式占位符必须原样保留；[TABLE] 段落按 Header:/Row: 格式逐格翻译',
     }, ensure_ascii=False))
 
 
@@ -1123,9 +1467,17 @@ def _build_markdown(meta, translations, workdir: Path):
     with open(workdir / 'paragraph_details.json', 'r', encoding='utf-8') as f:
         paragraphs = json.load(f)
 
+    # 公式映射（旧版 workdir 无此文件则视为无公式）
+    formulas = {}
+    formulas_file = workdir / 'formulas.json'
+    if formulas_file.exists():
+        with open(formulas_file, 'r', encoding='utf-8') as f:
+            formulas = json.load(f).get('formulas', {})
+
     translate_type = meta.get('translate_type', 'bilingual')
     result_md = build_bilingual_markdown(original_md, paragraphs, translations,
-                                         translate_type=translate_type)
+                                         translate_type=translate_type,
+                                         formulas=formulas)
 
     output_path = meta.get('output', '')
     if not output_path:
