@@ -17,6 +17,7 @@ TMP_DIR=""
 
 cleanup() {
     [ -n "$TMP_DIR" ] && rm -rf "$TMP_DIR"
+    return 0    # EXIT trap 的退出码会覆盖脚本退出码，必须显式归零（本地模式 TMP_DIR 为空时 [ -n ] 返回 1）
 }
 trap cleanup EXIT
 
