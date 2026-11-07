@@ -64,6 +64,12 @@ python3 {{SKILL_DIR}}/scripts/translate.py extract \
 电话/数据表行标记为 verbatim（保留原文不翻译，防数字误译）、
 整页扫描件导出（`scans/`，由步骤 2.5 识图翻译）。
 
+**EPUB 导航条目**：阅读器目录面板显示的标题来自 nav.xhtml / toc.ncx，
+其中带链接条目（如 `<li><a>Part One</a></li>`）游离于正文容器结构之外，
+由专门的导航机制提取并追加到段落末尾（meta.json 的 `nav_entries` / `nav_start`），
+build 时自动写回并保留 href。分批翻译时必须覆盖 `paragraphs.json` 全量段落
+（含末尾导航条目），否则目录仍会残留英文。纯页码/罗马数字条目自动跳过不译。
+
 ### 步骤 1.5：翻译术语表（保证人名/专有名词全书译名统一）
 
 1. 读取 `{workdir}/glossary_candidates.json`，得到候选专有名词列表

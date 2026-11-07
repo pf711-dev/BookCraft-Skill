@@ -15,12 +15,14 @@
 """
 
 import argparse
+import copy
 import html as html_module
 import json
 import re
 import sys
 import tempfile
 import zipfile
+from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -78,6 +80,100 @@ def find_html_files(epub_path: Path) -> list[Path]:
     for ext in ['*.html', '*.xhtml', '*.htm']:
         html_files.extend(epub_path.rglob(ext))
     return sorted(html_files, key=lambda x: x.name)
+
+
+# 纯页码/罗马数字条目（如 "17"、"xvii"、"125-26"）：无需翻译，导航写回时跳过
+PURE_PAGE_RE = re.compile(r'^[\sivxlcdmIVXLCDM0-9,.;:\-–—]*$')
+
+
+def _nav_text_ok(text: str) -> bool:
+    """导航条目文本是否值得翻译：非空、长度>2、非纯页码"""
+    t = text.strip()
+    return bool(t) and len(t) > 2 and not PURE_PAGE_RE.match(t)
+
+
+def _text_without_links(elem) -> str:
+    """返回 elem 去除 <a> 子树后的剩余文本（浅拷贝，不改原 DOM）"""
+    clone = copy.copy(elem)
+    for a in clone.find_all('a'):
+        a.decompose()
+    return clone.get_text()
+
+
+def extract_nav_entries(epub_extract_path: Path) -> list[dict]:
+    """提取 EPUB 导航条目文本（nav.xhtml 的 toc/landmarks/page-list <a> + toc.ncx navLabel）。
+
+    这些条目是阅读器目录面板显示的标题来源，常游离于正文容器结构之外
+    （如 <li><a>Part One</a><ol>...</ol></li> 中的 <a> 不属于任何最内层容器），
+    通用段落提取会遗漏；专门的导航机制保证中英目录一致。
+
+    返回 [{file, seq, text}]，seq 为该文件内同规则筛选列表中的序号，
+    写回时按同一规则重新定位，确定性成立（extract 与 build 之间文件不变）。
+    """
+    entries = []
+    for f in find_html_files(epub_extract_path):
+        try:
+            soup = BeautifulSoup(f.read_text(encoding='utf-8'), 'lxml')
+        except Exception:
+            continue
+        nav_links = [a for a in soup.find_all('a') if a.find_parent('nav') and _nav_text_ok(a.get_text())]
+        for seq, a in enumerate(nav_links):
+            entries.append({'file': str(f), 'seq': seq, 'text': a.get_text(strip=True)})
+    for f in sorted(epub_extract_path.rglob('*.ncx')):
+        try:
+            soup = BeautifulSoup(f.read_text(encoding='utf-8'), 'xml')
+        except Exception:
+            continue
+        labels = [nl for nl in soup.find_all('navLabel') if _nav_text_ok(nl.get_text())]
+        for seq, nl in enumerate(labels):
+            entries.append({'file': str(f), 'seq': seq, 'text': nl.get_text(strip=True)})
+    return entries
+
+
+def write_back_nav(meta: dict, translations: list[str]):
+    """将导航条目译文写回 nav.xhtml / toc.ncx（保留 href 等属性）"""
+    nav_entries = meta.get('nav_entries') or []
+    nav_start = meta.get('nav_start', -1)
+    if not nav_entries or nav_start < 0:
+        return
+    by_file = defaultdict(list)
+    for i, e in enumerate(nav_entries):
+        by_file[e['file']].append((i, e))
+    written = 0
+    for fname, items in by_file.items():
+        f = Path(fname)
+        if not f.exists():
+            continue
+        is_ncx = f.suffix == '.ncx'
+        parser = 'xml' if is_ncx else 'lxml'
+        try:
+            soup = BeautifulSoup(f.read_text(encoding='utf-8'), parser)
+        except Exception:
+            continue
+        if is_ncx:
+            nodes = [nl for nl in soup.find_all('navLabel') if _nav_text_ok(nl.get_text())]
+        else:
+            nodes = [a for a in soup.find_all('a') if a.find_parent('nav') and _nav_text_ok(a.get_text())]
+        for i, e in items:
+            zh_idx = nav_start + i
+            if zh_idx >= len(translations) or e['seq'] >= len(nodes):
+                continue
+            zh = translations[zh_idx].strip()
+            if not zh:
+                continue
+            node = nodes[e['seq']]
+            if is_ncx:
+                target = node.find('text') or node
+                target.string = zh
+            else:
+                href = node.get('href')
+                node.clear()
+                node.string = zh
+                if href:
+                    node['href'] = href
+            written += 1
+        f.write_text(str(soup), encoding='utf-8')
+    print(f'  导航条目写回: {written} 条', flush=True)
 
 
 TEXT_CONTAINER_TAGS = ('p', 'div', 'blockquote', 'li', 'td', 'th',
@@ -207,6 +303,11 @@ def pre_extract_chapter(html_file: Path) -> ChapterData:
         for elem in body.find_all(TEXT_CONTAINER_TAGS):
             # 只处理最内层文本容器（排除包含其他容器的外层容器，避免重复提取）
             if elem.find(TEXT_CONTAINER_TAGS):
+                continue
+            # <nav> 内的链接型锚点（阅读器目录条目 <li><a>xx</a></li> 等）：文本几乎全部来自 <a> 时
+            # 不做 DOM 替换（会破坏 href 导致目录跳转失效），交由 nav_entries 机制翻译写回。
+            # 非导航区域（如书内目录页、正文脚注链接）不受影响，保持原机制。
+            if elem.find_parent('nav') and (elem.name == 'a' or (elem.find('a') and _text_without_links(elem).strip() == '')):
                 continue
             text = elem.get_text().strip()
             if not text:
@@ -867,6 +968,14 @@ def _extract_epub(args, workdir: Path):
                 'is_heading': [],
             })
 
+    # 导航条目（nav.xhtml / toc.ncx）：阅读器目录面板显示的标题，
+    # 通用容器提取遗漏带链接条目，这里专门提取并追加到段落末尾参与翻译
+    nav_entries = extract_nav_entries(epub_extract_path)
+    nav_start = len(all_paragraphs)
+    all_paragraphs.extend(e['text'] for e in nav_entries)
+    if nav_entries:
+        print(f'  导航条目待译: {len(nav_entries)} 条', flush=True)
+
     # 保存段落和元信息
     with open(workdir / 'paragraphs.json', 'w', encoding='utf-8') as f:
         json.dump({'paragraphs': all_paragraphs}, f, ensure_ascii=False, indent=2)
@@ -883,6 +992,8 @@ def _extract_epub(args, workdir: Path):
             'output': str(args.output) if args.output else '',
             'translate_type': args.type,
             'chapters': chapter_meta,
+            'nav_entries': nav_entries,
+            'nav_start': nav_start,
             'total_paragraphs': len(all_paragraphs),
         }, f, ensure_ascii=False, indent=2)
 
@@ -991,6 +1102,9 @@ def _build_epub(meta, translations, workdir: Path):
             start = chapter['start']
             chapter_translations = translations[start:start + chapter['count']]
             write_back_chapter(cd, chapter_translations, translate_type)
+
+    # 导航条目译文写回（nav.xhtml / toc.ncx，阅读器目录面板标题）
+    write_back_nav(meta, translations)
 
     add_styles(epub_extract_path)
     output_path = meta.get('output', '')
