@@ -25,3 +25,6 @@ tests/make_samples.py
 # 人工测试样例的二进制产物（make_samples.py 生成，不入库）
 tests/samples/*.epub
 tests/samples/*.pdf
+
+# 本地平台素材（WorkBuddy 头像等，自行管理不上传）
+assets/
