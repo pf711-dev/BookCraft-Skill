@@ -44,6 +44,7 @@ mkdir -p "$SKILLS_DIR"
 rm -rf "$INSTALL_DIR"
 cp -R "$SRC_DIR" "$INSTALL_DIR"
 rm -rf "${INSTALL_DIR}/.git"   # skills 目录无需保留 git 历史
+rm -f "${INSTALL_DIR}/AGENTS.md"  # 本地开发备注不入生产目录/平台包
 
 # 2. 安装 Python 依赖（已装则跳过；PEP 668 受管环境下失败仅提示，不阻断安装）
 echo "🐍 安装 Python 依赖 ..."
