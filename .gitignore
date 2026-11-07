@@ -18,6 +18,10 @@ Thumbs.db
 # Agent 本地备注（不上传）
 AGENTS.md
 
+# 内部人工测试文档（不上传，本地保留自用）
+tests/MANUAL_TEST_PLAN.md
+tests/make_samples.py
+
 # 人工测试样例的二进制产物（make_samples.py 生成，不入库）
 tests/samples/*.epub
 tests/samples/*.pdf

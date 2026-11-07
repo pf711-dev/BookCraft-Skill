@@ -2,15 +2,24 @@
 name: bookcraft
 version: 1.3.0
 description: |
-  双语翻译工具（BookCraft）：将英文 EPUB、Markdown 或 PDF 翻译成中英对照或仅中文版本。
+  BookCraft 是一个将「英文 EPUB/Markdown/PDF」电子书一键翻译成「中英或仅中文 EPUB/Markdown」的 Skill。
   触发条件：用户说"翻译"、"双语翻译"、"中英对照"、"translate"、
   "翻译 EPUB"、"翻译 Markdown"、"翻译 PDF"、"翻译电子书"等，或用户提供 EPUB/Markdown/PDF 文件要求翻译。
 ---
 
 # Skill: BookCraft
-# 双语翻译工具
+# 电子书双语翻译工具
 
-将英文 EPUB、Markdown 或 PDF 翻译成中英对照或仅中文版本。
+BookCraft 是一个将「英文 EPUB/Markdown/PDF」电子书一键翻译成「中英或仅中文 EPUB/Markdown」格式的 Skill。
+
+## 能力速览
+
+- EPUB / Markdown / PDF（文本型）三种输入
+- 中英对照 或 仅中文 两种输出
+- 表格逐格翻译（Markdown / EPUB；PDF 数据行保留原文、表头翻译）
+- 数学公式一律原样保留，译文中的公式与原文完全一致
+- 术语表统一全书人名译名（支持手动术语表）
+- 数据表行、电话、地址自动保留原文，防数字误译
 
 ## 支持的文件类型
 
