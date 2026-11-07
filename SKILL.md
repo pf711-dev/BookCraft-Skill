@@ -3,7 +3,7 @@ name: bookcraft
 version: 1.3.0
 display_name: "BookCraft 电子书双语翻译"
 display_name_en: "BookCraft"
-description_zh: "BookCraft 是一个将英文 EPUB、Markdown、PDF 电子书一键翻译成中英或仅中文 EPUB、Markdown 格式的 Skill。"
+description_zh: "BookCraft 是一个英文电子书翻译工具。\n- 支持 EPUB、Markdown、文本型 PDF 一键翻译成中英对照，或仅中文格式。\n- EPUB、Markdown 表格逐格翻译、公式保护不被改写。\n- 术语表统一全书译名。"
 description_en: "Bilingual eBook translator — EPUB / Markdown / PDF to English-Chinese dual or Chinese-only. Cell-level table translation, formula protection (never rewritten), unified glossary terminology, no API key required."
 description: |
   BookCraft 是一个将「英文 EPUB/Markdown/PDF」电子书一键翻译成「中英或仅中文 EPUB/Markdown」的 Skill。
