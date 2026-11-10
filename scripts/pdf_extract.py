@@ -214,27 +214,37 @@ def extract_pdf(input_path: str, workdir: str, chapters_mode: str = 'auto',
         titles = collect_heading_candidates(doc, body_size, heading_delta)
 
     if len(titles) < 2:
-        raise SystemExit(
-            f"仅检测到 {len(titles)} 个章节标题，章节切分不可靠。\n"
-            f"建议：1) 用 --chapters pattern --chapter-pattern '...' 提供章节标题正则；\n"
-            f"      2) 或 --chapters outline（需要 PDF 书签）；\n"
-            f"      3) 或调大 --heading-delta（当前 {heading_delta}）。")
+        if chapters_mode == 'pattern':
+            # 用户显式提供的正则没匹配到 → 约束未满足，报错让用户修
+            raise SystemExit(
+                f"正则未匹配到章节标题（{len(titles)} 个）。"
+                f"请检查 --chapter-pattern：{chapter_pattern}")
+        # 自动检测失败（图片型 PDF 无文本层 / 无标题结构的书）→ 整本单章 fallback。
+        # 扫描页截图照常产出 scans/，模型视觉能力由预检（SKILL.md 步骤 1.2）判断；
+        # 识图翻译时按 chapter_start 标记在 build 阶段重建章节
+        print(f"⚠️  自动章节检测仅命中 {len(titles)} 个标题，回退为整本单章。"
+              f"若为图片型 PDF，将由预检判断模型视觉能力后走整本识图翻译", file=sys.stderr)
+        titles = {}
 
-    # 2. 组章节：front（首个标题前的页）+ 各标题页区间
+    # 2. 组章节：front（首个标题前的页）+ 各标题页区间；无标题 → 整本单章
     starts = sorted(titles.keys())
     headers, footers = detect_headers_footers(doc)
     if headers or footers:
         print(f"页眉黑名单: {len(headers)} 条，页脚黑名单: {len(footers)} 条")
 
     chapters = []
-    if starts[0] > 0:
-        chapters.append({"id": "front", "title_en": "Front Matter",
-                         "pages": [1, starts[0]], "blocks": []})
-    for i, pno in enumerate(starts):
-        end = starts[i + 1] if i + 1 < len(starts) else doc.page_count
-        chapters.append({"id": f"chapter_{i+1:02d}", "title_en": titles[pno],
-                         "pages": [pno + 1, end], "blocks": [],
-                         "heading_page": pno})
+    if not starts:
+        chapters.append({"id": "book", "title_en": Path(input_path).stem,
+                         "pages": [1, doc.page_count], "blocks": []})
+    else:
+        if starts[0] > 0:
+            chapters.append({"id": "front", "title_en": "Front Matter",
+                             "pages": [1, starts[0]], "blocks": []})
+        for i, pno in enumerate(starts):
+            end = starts[i + 1] if i + 1 < len(starts) else doc.page_count
+            chapters.append({"id": f"chapter_{i+1:02d}", "title_en": titles[pno],
+                             "pages": [pno + 1, end], "blocks": [],
+                             "heading_page": pno})
 
     # 3. 逐页提取块
     img_count = scan_count = 0
@@ -284,10 +294,11 @@ def extract_pdf(input_path: str, workdir: str, chapters_mode: str = 'auto',
                 ch["blocks"].append({"t": "p", "text": txt, "y": round(y0),
                                      **({"heading": True} if heading else {})})
             # 标记末个文本块已消费（简化：循环内按顺序处理即可）
-    # 扫描版警告
+    # 扫描页占比提示（中性）：图片型 PDF 是否可译取决于模型视觉能力，预检时判断
     if scan_count > doc.page_count * 0.6:
-        print(f"⚠️  {scan_count}/{doc.page_count} 页为扫描页——这是扫描版书籍。\n"
-              f"   整本识图翻译不现实，建议先用 OCR 工具转文本后再运行本流程。", file=sys.stderr)
+        print(f"ℹ️  {scan_count}/{doc.page_count} 页为扫描页（图片型 PDF）。"
+              f"整本将走识图翻译（约 {scan_count} 次视觉调用），"
+              f"需要模型具备视觉能力——预检时将自动判断并告知用户", file=sys.stderr)
 
     # 4. 跨页段落合并（排除 verbatim 候选块：数据行不与表头/正文行拼接，
     #    否则表头被数据行吞进同一块后整块 verbatim，表头就进不了翻译流）
@@ -343,6 +354,10 @@ def extract_pdf(input_path: str, workdir: str, chapters_mode: str = 'auto',
     with open(workdir / "glossary_candidates.json", "w", encoding="utf-8") as f:
         json.dump({"candidates": candidates}, f, ensure_ascii=False, indent=2)
 
+    # 预检预估字段（SKILL.md 步骤 1.2 预检报告用；est_batches 为 3000 词/批口径）
+    total_words = sum(len(p.split()) for p in paragraphs)
+    est_batches = -(-total_words // 3000)  # ceil
+
     meta = {
         "type": "pdf", "input": str(input_path), "output": output,
         "translate_type": translate_type,
@@ -353,6 +368,7 @@ def extract_pdf(input_path: str, workdir: str, chapters_mode: str = 'auto',
         "total_paragraphs": len(paragraphs),
         "verbatim_paragraphs": verbatim_count,
         "content_images": img_count, "scan_pages": scan_count,
+        "total_words": total_words, "est_batches": est_batches,
     }
     with open(workdir / "meta.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, ensure_ascii=False, indent=2)
@@ -364,9 +380,11 @@ def extract_pdf(input_path: str, workdir: str, chapters_mode: str = 'auto',
         "total_paragraphs": len(paragraphs),
         "verbatim_paragraphs": verbatim_count,
         "content_images": img_count, "scan_pages": scan_count,
+        "total_words": total_words, "est_batches": est_batches,
         "workdir": str(workdir),
-        "next_step": "Agent 先翻译术语表写入 glossary.json，再分批翻译段落写入 translations.json"
-                     "（数组与 paragraphs.json 一一对应）；扫描页识图翻译写 scan_translations.json",
+        "next_step": "按 SKILL.md 步骤 1.2 生成预检报告，用户确认后先翻译术语表写入 glossary.json，"
+                     "再分批翻译段落写入 translations.json（数组与 paragraphs.json 一一对应）；"
+                     "扫描页识图翻译写 scan_translations.json",
     }, ensure_ascii=False, indent=1))
     return meta
 

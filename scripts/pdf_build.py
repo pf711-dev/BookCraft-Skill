@@ -119,13 +119,28 @@ def build_pdf(meta, translations, workdir):
     spine, toc = ["nav"], []
     md_all = [f"# {Path(meta['input']).stem}\n",
               "> BookCraft PDF 翻译。表格数据/信头地址等保留原文；扫描原件译文在前、原图附后。\n"]
-    seq = 0
+
+    # 动态分章：普通书一章一个 XHTML；整本扫描书（fallback 单章）在 build 时按
+    # scan_translations.json 的 chapter_start 标记切章，避免几百页挤一个 XHTML
+    file_seq = 0
+
+    def flush_chapter(cur):
+        nonlocal file_seq
+        file_seq += 1
+        ecl = epub.EpubHtml(title=cur["title"], file_name=f"{cur['id']}.xhtml", lang="zh")
+        ecl.content = ("<html><head><link rel='stylesheet' href='style/main.css'/></head><body>"
+                       + "\n".join(cur["html"]) + "</body></html>")
+        book.add_item(ecl)
+        spine.append(ecl)
+        toc.append(ecl)
+        md_all.extend(cur["md"])
+
     for chmeta in meta["chapters"]:
         ch = json.load(open(workdir / "chapters" / f"{chmeta['id']}.json", encoding="utf-8"))
-        seq += 1
         title = chmeta["title_en"]
-        html = [f"<h1>{esc(title)}</h1>"]
-        md = [f"\n---\n\n## {title}\n"]
+        cur = {"id": chmeta["id"], "title": title,
+               "html": [f"<h1>{esc(title)}</h1>"],
+               "md": [f"\n---\n\n## {title}\n"]}
         skip_until = -1  # 连续 verbatim 聚合后跳过已消费块（索引不动，保 pid 稳定）
         for idx, blk in enumerate(ch["blocks"]):
             pid = f"{ch['id']}:{idx}"
@@ -135,8 +150,8 @@ def build_pdf(meta, translations, workdir):
                 if blk.get("heading"):
                     zh = pid2zh.get(pid)
                     if zh:
-                        html[-1] = f"<h1>{esc(zh)}</h1>"
-                        md[-1] = f"\n---\n\n## {zh}\n"
+                        cur["html"][-1] = f"<h1>{esc(zh)}</h1>"
+                        cur["md"][-1] = f"\n---\n\n## {zh}\n"
                     continue
                 if blk.get("verbatim"):
                     # 连续 verbatim 块（数据表多行/公式组）聚合为一个整体，视觉完整
@@ -148,35 +163,36 @@ def build_pdf(meta, translations, workdir):
                         j += 1
                     skip_until = j
                     joined = "\n".join(parts)
-                    html.append(f"<div class='table-verbatim'>{esc(joined)}</div>")
-                    md.append(f"```\n{joined}\n```\n")
+                    cur["html"].append(f"<div class='table-verbatim'>{esc(joined)}</div>")
+                    cur["md"].append(f"```\n{joined}\n```\n")
                     continue
                 zh = pid2zh.get(pid)
                 if bilingual:
-                    html.append(f"<p class='en'>{esc(blk['text'])}</p>")
+                    cur["html"].append(f"<p class='en'>{esc(blk['text'])}</p>")
                     if zh:
-                        html.append(f"<p class='zh'>{esc(zh)}</p>")
-                        md.append(f"{blk['text']}\n\n> 🇨🇳 {zh}\n")
+                        cur["html"].append(f"<p class='zh'>{esc(zh)}</p>")
+                        cur["md"].append(f"{blk['text']}\n\n> 🇨🇳 {zh}\n")
                     else:
-                        md.append(f"{blk['text']}\n")
+                        cur["md"].append(f"{blk['text']}\n")
                 else:
-                    html.append(f"<p>{esc(zh or blk['text'])}</p>")
-                    md.append(f"{zh or blk['text']}\n")
+                    cur["html"].append(f"<p>{esc(zh or blk['text'])}</p>")
+                    cur["md"].append(f"{zh or blk['text']}\n")
             elif blk["t"] == "img" and not blk.get("small"):
-                html.append(f"<div class='fig-center'><img src='{blk['file']}' alt='插图'/></div>")
-                md.append(f"![插图]({blk['file']})\n")
+                cur["html"].append(f"<div class='fig-center'><img src='{blk['file']}' alt='插图'/></div>")
+                cur["md"].append(f"![插图]({blk['file']})\n")
             elif blk["t"] == "scan":
-                rendered, md_scan = render_scan(blk["file"], scan_cn.get(Path(blk["file"]).name), md)
-                html.append(rendered)
-                md.extend(md_scan)
-
-        ecl = epub.EpubHtml(title=title, file_name=f"{ch['id']}.xhtml", lang="zh")
-        ecl.content = ("<html><head><link rel='stylesheet' href='style/main.css'/></head><body>"
-                       + "\n".join(html) + "</body></html>")
-        book.add_item(ecl)
-        spine.append(ecl)
-        toc.append(ecl)
-        md_all.extend(md)
+                info = scan_cn.get(Path(blk["file"]).name)
+                # 章节起始扫描页：落盘当前章、开新章（首块/空章不切）
+                if info and info.get("chapter_start") and len(cur["html"]) > 1:
+                    flush_chapter(cur)
+                    t = info.get("chapter_title") or info.get("title") or f"第 {file_seq + 1} 部分"
+                    cur = {"id": f"{chmeta['id']}_s{idx}", "title": t,
+                           "html": [f"<h1>{esc(t)}</h1>"],
+                           "md": [f"\n---\n\n## {t}\n"]}
+                rendered, md_scan = render_scan(blk["file"], info, cur["md"])
+                cur["html"].append(rendered)
+                cur["md"].extend(md_scan)
+        flush_chapter(cur)
 
     book.toc = tuple(toc)
     book.add_item(epub.EpubNcx())
@@ -192,12 +208,12 @@ def build_pdf(meta, translations, workdir):
     with open(md_path, "w", encoding="utf-8") as f:
         f.write("\n".join(md_all))
 
-    # 完整性对账
+    # 完整性对账（chapters 为切分后实际 XHTML 数，含 chapter_start 切出的新章）
     n_translated = sum(1 for p in pids if pid2zh.get(p))
     print(json.dumps({
         "status": "built", "output": output, "markdown": md_path,
         "paragraphs_total": len(pids), "paragraphs_translated": n_translated,
         "untranslated_kept_original": len(pids) - n_translated,
-        "chapters": len(meta["chapters"]),
+        "chapters": len(meta["chapters"]), "chapters_xhtml": len(toc),
     }, ensure_ascii=False, indent=1))
     return output

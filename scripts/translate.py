@@ -1261,6 +1261,13 @@ def run_extract(args):
         _extract_markdown(args, workdir)
 
 
+def _word_estimates(paragraphs):
+    """词数与批次预估（预检报告用；est_batches 为 3000 词/批口径，SKILL.md 步骤 1.2）"""
+    total_words = sum(len(p.split()) for p in paragraphs)
+    est_batches = -(-total_words // 3000)  # ceil
+    return total_words, est_batches
+
+
 def _extract_pdf(args, workdir: Path):
     """提取 PDF（结构化提取层：章节/图片/扫描页/verbatim）"""
     try:
@@ -1323,6 +1330,9 @@ def _extract_epub(args, workdir: Path):
     with open(workdir / 'glossary_candidates.json', 'w', encoding='utf-8') as f:
         json.dump({'candidates': candidates}, f, ensure_ascii=False, indent=2)
 
+    # 预检预估字段（SKILL.md 步骤 1.2 预检报告用）
+    total_words, est_batches = _word_estimates(all_paragraphs)
+
     with open(workdir / 'meta.json', 'w', encoding='utf-8') as f:
         json.dump({
             'type': 'epub',
@@ -1333,16 +1343,20 @@ def _extract_epub(args, workdir: Path):
             'nav_entries': nav_entries,
             'nav_start': nav_start,
             'total_paragraphs': len(all_paragraphs),
+            'total_words': total_words,
+            'est_batches': est_batches,
         }, f, ensure_ascii=False, indent=2)
 
     print(json.dumps({
         'status': 'extracted',
         'type': 'epub',
         'total_paragraphs': len(all_paragraphs),
+        'total_words': total_words,
+        'est_batches': est_batches,
         'workdir': str(workdir),
         'paragraphs_file': str(workdir / 'paragraphs.json'),
         'glossary_candidates': len(candidates),
-        'next_step': 'Agent 先翻译术语表写入 glossary.json，再逐批翻译段落，结果写入 translations.json',
+        'next_step': '按 SKILL.md 步骤 1.2 生成预检报告，用户确认后再翻译',
     }, ensure_ascii=False))
 
 
@@ -1356,6 +1370,9 @@ def _extract_markdown(args, workdir: Path):
     with open(workdir / 'paragraphs.json', 'w', encoding='utf-8') as f:
         json.dump({'paragraphs': paragraphs}, f, ensure_ascii=False, indent=2)
 
+    # 预检预估字段（SKILL.md 步骤 1.2 预检报告用）
+    total_words, est_batches = _word_estimates(paragraphs)
+
     with open(workdir / 'meta.json', 'w', encoding='utf-8') as f:
         json.dump({
             'type': 'markdown',
@@ -1363,6 +1380,8 @@ def _extract_markdown(args, workdir: Path):
             'output': str(args.output) if args.output else '',
             'translate_type': args.type,
             'total_paragraphs': len(paragraphs),
+            'total_words': total_words,
+            'est_batches': est_batches,
             'is_heading': is_heading,
             'original_md_file': str(workdir / 'original.md'),
         }, f, ensure_ascii=False, indent=2)
@@ -1387,12 +1406,14 @@ def _extract_markdown(args, workdir: Path):
         'status': 'extracted',
         'type': 'markdown',
         'total_paragraphs': len(paragraphs),
+        'total_words': total_words,
+        'est_batches': est_batches,
         'formulas_protected': len(data.get('formulas', {})),
         'table_units': sum(1 for p in data['paragraphs'] if p.get('type') == 'table'),
         'workdir': str(workdir),
         'paragraphs_file': str(workdir / 'paragraphs.json'),
         'glossary_candidates': len(candidates),
-        'next_step': 'Agent 先翻译术语表写入 glossary.json，再逐批翻译段落，结果写入 translations.json；'
+        'next_step': '按 SKILL.md 步骤 1.2 生成预检报告，用户确认后再翻译；'
                      '⟦Mn⟧ 公式占位符必须原样保留；[TABLE] 段落按 Header:/Row: 格式逐格翻译',
     }, ensure_ascii=False))
 

@@ -1,10 +1,10 @@
 ---
 name: bookcraft
-version: 1.3.0
+version: 1.4.0
 display_name: "BookCraft 电子书双语翻译"
 display_name_en: "BookCraft"
-description_zh: "BookCraft 是一个英文电子书翻译工具。\n- 支持 EPUB、Markdown、文本型 PDF 一键翻译成中英对照，或仅中文格式。\n- EPUB、Markdown 表格逐格翻译、公式保护不被改写。\n- 术语表统一全书译名。"
-description_en: "Bilingual eBook translator — EPUB / Markdown / PDF to English-Chinese dual or Chinese-only. Cell-level table translation, formula protection (never rewritten), unified glossary terminology, no API key required."
+description_zh: "BookCraft 是一个英文电子书翻译工具。\n- 支持 EPUB、Markdown、PDF（含扫描版）一键翻译成中英对照，或仅中文格式。\n- 翻译前预检：时间/token 消耗/输出文件预估，一次确认后自动跑完。\n- 表格逐格翻译、公式保护、术语表统一译名；扫描页识图翻译。"
+description_en: "Bilingual eBook translator — EPUB / Markdown / PDF (incl. scanned) to English-Chinese dual or Chinese-only. Pre-flight check with time/token/output estimates before translating. Cell-level table translation, formula protection, unified glossary, vision-based scan-page translation."
 description: |
   BookCraft 是一个将「英文 EPUB/Markdown/PDF」电子书一键翻译成「中英或仅中文 EPUB/Markdown」的 Skill。
   触发条件：用户说"翻译"、"双语翻译"、"中英对照"、"translate"、
@@ -18,10 +18,12 @@ BookCraft 是一个将英文 EPUB、Markdown、PDF 电子书一键翻译成中�
 
 ## 能力速览
 
-- EPUB / Markdown / PDF（文本型）三种输入
+- EPUB / Markdown / PDF 三种输入（PDF 含文本型与图片型/扫描版）
 - 中英对照 或 仅中文 两种输出
+- **翻译前预检**：时间 / token 消耗 / 输出文件预估，一次确认后自动跑完
 - 表格逐格翻译（Markdown / EPUB；PDF 数据行保留原文、表头翻译）
 - 数学公式一律原样保留，译文中的公式与原文完全一致
+- 扫描页识图翻译（需模型视觉能力，预检时自动判断）
 - 术语表统一全书人名译名（支持手动术语表）
 - 数据表行、电话、地址自动保留原文，防数字误译
 
@@ -34,8 +36,10 @@ BookCraft 是一个将英文 EPUB、Markdown、PDF 电子书一键翻译成中�
 | PDF | `.pdf` | 仅中文或中英对照 EPUB + Markdown 备份（保留原图与扫描原件）；公式行/数据表行自动 verbatim 保留原文 |
 
 > PDF 翻译由结构化提取层 + 组装层实现：文本型 PDF 按章节提取段落，
-> 图片按原位置锚定，整页扫描件译文在前、原图附后。扫描页占比超 60%
-> （整页文本 <20 字符的页面）会提示先 OCR，不在本 skill 能力范围内。
+> 图片按原位置锚定，整页扫描件译文在前、原图附后。图片型 PDF（扫描页占比高）
+> 自动回退整本单章提取，扫描页全部导出 `scans/` 由识图翻译，
+> 是否可译取决于当前模型是否具备视觉能力——预检（步骤 1.2）时自动判断。
+> 单页判定：整页文本 <20 字符，`--scan-min-chars` 可调。
 
 ## 翻译类型
 
@@ -71,7 +75,8 @@ python3 {{SKILL_DIR}}/scripts/translate.py extract \
 | `--chapters pattern --chapter-pattern '...'` | 按正则匹配页首文本，适配无大字号标题的书（如信件集）。**正则要用行锚定**（如 `^((Interim|Annual) Letter)\.?$`），避免正文词汇误匹配；支持多行标题拼接匹配 |
 
 提取后**必须检查 meta.json 的章节数与页码区间是否合理**（对比目录页），
-不合理就换策略重跑 extract。警告"扫描页占比超 60%"时告知用户需先 OCR。
+不合理就换策略重跑 extract。若提取层提示"回退为整本单章"且扫描页占比高，
+说明是图片型 PDF，是否能继续由步骤 1.2 预检的视觉探测决定。
 
 提取层同时处理：页码/页眉/页脚剔除、跨页段落合并、断词修复、
 电话/数据表行/公式行标记为 verbatim（保留原文不翻译，防数字误译与公式改写）、
@@ -92,6 +97,51 @@ python3 {{SKILL_DIR}}/scripts/translate.py extract \
 由专门的导航机制提取并追加到段落末尾（meta.json 的 `nav_entries` / `nav_start`），
 build 时自动写回并保留 href。分批翻译时必须覆盖 `paragraphs.json` 全量段落
 （含末尾导航条目），否则目录仍会残留英文。纯页码/罗马数字条目自动跳过不译。
+
+### 步骤 1.2：预检与确认（必须，三种格式统一）
+
+extract 完成后、开始翻译前，向用户展示预检报告并等待确认——
+这是**全流程唯一一次确认点**，确认后一口气跑完不再中断。
+
+**1. 视觉探测**（仅 PDF 且 meta.json `scan_pages > 0` 时）：
+用 read 工具读一张 `{workdir}/scans/` 下的截图并描述其内容——
+能读到并正确描述 → 当前模型有视觉能力；工具报错或看不到图 → 无视觉。
+
+**2. 预检报告**（列表形式，数据取自 extract stdout / meta.json）：
+
+```
+📋 翻译预检 — 请确认后开始
+
+《{书名}》（{页数/章节数} · 约 {total_words} 万词 · {content_images} 图 · {scan_pages} 扫描页）
+- 翻译类型：{中英对照（默认）/ 仅中文}
+- 输出文件：{输出路径，含命名后缀 _bilingual/_chinese_only}
+- 工作目录：{workdir}
+- 当前模型：{模型名}（{支持 ✓ / 不支持 ✗}视觉）
+- 预计耗时：约 N 分钟（{est_batches} 批文本 ÷ 并发4 [+ {scan_pages} 页识图]）
+- 预计消耗：输入 ~N tok · 输出 ~N tok{（约 ¥N，参考价）}
+- 章节预览：共 N 章，前 3 章为：…（发现切分错误在此时换策略重跑）
+
+确认无误回复「开始」；要调整直接说明（如：改成仅中文 / 章节不对）。
+```
+
+**3. 估算口径**（统一使用，token 为硬数据、价格为参考值）：
+
+| 项 | 口径 |
+|----|------|
+| 输入 token | 英文词数 × 1.3 |
+| 输出 token | 仅中文 ≈ 词数 × 2；中英对照 ≈ 词数 × 3.3 |
+| 识图调用 | 每页 ≈ 输入 2k tok + 译文输出（几百 tok） |
+| 文本耗时 | 批次数 ÷ 4 并发 ×（flash 级 ~1.5 分/批；旗舰级 ~4 分/批） |
+| 识图耗时 | 页数 × ~0.5 分（可 4 并发） |
+| 价格 | 按当前模型公开定价折算，标注"参考价"，不硬编码 |
+
+**4. 异常处理**：
+- 无视觉 + 扫描页 > 0 → 报告中追加一行：
+  `⚠️ 当前模型无法识图，N 页扫描件：a) 换多模态模型重跑 b) 跳过扫描页只译文本（保留原图）`
+  等用户选择后再继续
+- 工作量较大（est_batches > 30 或扫描页 > 100）→ 提示预计耗时较长，确认后继续
+- 全书无文本（total_words ≈ 0 且 scan_pages > 0）→ 纯识图翻译，
+  预检报告只需识图相关行
 
 ### 步骤 1.5：翻译术语表（保证人名/专有名词全书译名统一）
 
@@ -184,13 +234,15 @@ build 时自动写回并保留 href。分批翻译时必须覆盖 `paragraphs.js
 
 ### 步骤 3.5：扫描页识图翻译（仅 PDF，meta.json 中 scan_pages > 0 时）
 
-1. 逐张查看 `{workdir}/scans/scan_pNNN.png`（多模态读图）
+1. 逐张查看 `{workdir}/scans/scan_pNNN.png`（多模态读图，可 4 并发）
 2. 将内容翻译为中文，连同 `{workdir}/scan_translations.json`：
 ```json
 {
   "scan_p003.png": {
     "title": "页面标题",
     "note": "此页为原件扫描图，以下为译文",
+    "chapter_start": true,
+    "chapter_title": "第一章 标题",
     "blocks": [
       {"h": "小标题"},
       {"p": "正文段落"},
@@ -200,7 +252,10 @@ build 时自动写回并保留 href。分批翻译时必须覆盖 `paragraphs.js
   }
 }
 ```
-3. 图中模糊无法辨认的词按字形转录并保留英文，有原图兜底
+3. **章节重建**（图片型 PDF 几乎必用）：识别到某页是新章节起始页时，
+   该页条目加 `"chapter_start": true` + `"chapter_title": "中文章节标题"`，
+   build 时自动在此切出新章；封面/版权页/前言等非章节页不标
+4. 图中模糊无法辨认的词按字形转录并保留英文，有原图兜底
 
 ### 步骤 4：组装最终文件
 
@@ -283,24 +338,24 @@ python3 -c "import fitz; import ebooklib; print('PDF OK')"
 
 ## 对话规则
 
-1. **收到翻译请求后直接执行**，不要反复确认。如果文件路径不明确，问一句即可。
+1. **收到翻译请求后先提取，然后按步骤 1.2 预检确认**——这是唯一一次确认点，
+   确认后不再中断（翻译中的质量校验回退除外）。文件路径不明确，问一句即可。
 2. **翻译过程中展示进度**。每完成一批报告进度。
-3. **大文件提前预估**。文件超过 200 段时改用模式 B 并行子代理翻译（并发 ≤ 4）；
-   提前告知耗时（每 1000 段约 10-20 分钟）与 token 消耗量级。
+3. **预估信息统一在预检报告给出**（时间/token/输出），不要等出问题再停。
 4. **输出文件路径告知用户**，方便查找。
-5. **翻译类型尊重用户选择**。用户没说则默认双语。
+5. **翻译类型尊重用户选择**。用户没说则默认中英对照，预检报告里再次列出供确认。
 6. **不要修改原文件**，翻译结果始终写入新文件。
-7. **PDF 章节切分必须人工核对**。提取后对比 meta.json 章节列表与原书目录，
-   切分错误时换策略重跑，宁可多核对一次也不要带错翻译。
+7. **PDF 章节切分在预检时人工核对**（章节预览行）。切分错误时换策略重跑，
+   宁可多核对一次也不要带错翻译。
 
 ## 边界
 
 - 只翻译英文到中文，不支持其他语言对
-- 处理 EPUB、Markdown、文本型 PDF 三种格式
-- PDF：支持文本型 PDF（含少量整页扫描件，走识图翻译）；**不支持扫描版书籍**
-  （扫描页占比 >60% 的 PDF 会提示先 OCR，整本识图翻译不现实；
-  单页判定：整页文本 <20 字符，`--scan-min-chars` 可调）
-- 不做 OCR（整页扫描件的识图翻译除外，那是多模态能力而非 OCR 流水线）
+- 处理 EPUB、Markdown、PDF 三种格式
+- PDF：文本型直接提取翻译；图片型（扫描版）走整本识图翻译，
+  **需当前模型具备视觉能力**（预检时自动探测）；无视觉时可跳过扫描页只译文本
+  （扫描块保留原图，不丢内容）或建议用户换多模态模型
+- 扫描页识图翻译是模型多模态能力，不是 OCR 流水线；无视觉模型自动降级并告知
 - 不做网页抓取翻译
 - 翻译质量取决于模型能力，不提供人工审校
 

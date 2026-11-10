@@ -174,5 +174,90 @@ def _make_sample_pdf(path):
     doc.close()
 
 
+def _make_scanned_pdf(path, pages=4):
+    """图片型 PDF：每页仅插入无文字的位图（无文本层）"""
+    import fitz
+    doc = fitz.open()
+    # 生成一张无文字的位图作为扫描页内容
+    pix_img = fitz.Pixmap(fitz.csRGB, fitz.IRect(0, 0, 200, 280))
+    pix_img.clear_with(90)
+    for i in range(pages):
+        page = doc.new_page(width=400, height=560)
+        page.insert_image(fitz.Rect(20, 20, 380, 540), pixmap=pix_img)
+    doc.save(path)
+    doc.close()
+
+
+@unittest.skipUnless(HAS_FITZ, "需要 pymupdf")
+class ScannedFallbackTests(unittest.TestCase):
+    """图片型 PDF：章节 fallback 单章 + scans 全量导出 + 预检预估字段"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix='bc_scan_test_')
+        cls.pdf_path = str(Path(cls.tmp) / 'scanned.pdf')
+        cls.workdir = Path(cls.tmp) / 'work'
+        _make_scanned_pdf(cls.pdf_path, pages=4)
+        from pdf_extract import extract_pdf
+        cls.meta = extract_pdf(
+            input_path=cls.pdf_path, workdir=str(cls.workdir),
+            chapters_mode='auto', translate_type='chinese_only')
+
+    def test_fallback_single_chapter(self):
+        """无文本层 → 不 SystemExit，回退整本单章（id=book，书名做章名）"""
+        self.assertEqual(len(self.meta['chapters']), 1)
+        self.assertEqual(self.meta['chapters'][0]['id'], 'book')
+        self.assertEqual(self.meta['chapters'][0]['title_en'], 'scanned')
+        self.assertEqual(self.meta['chapters'][0]['pages'], [1, 4])
+
+    def test_all_pages_scanned(self):
+        self.assertEqual(self.meta['scan_pages'], 4)
+        scans = list((self.workdir / 'scans').glob('scan_p*.png'))
+        self.assertEqual(len(scans), 4)
+
+    def test_estimate_fields(self):
+        """预检预估字段：全书无文本 → 0 词 0 批（纯识图翻译）"""
+        self.assertEqual(self.meta['total_words'], 0)
+        self.assertEqual(self.meta['est_batches'], 0)
+        self.assertEqual(self.meta['total_paragraphs'], 0)
+
+    def test_pattern_no_match_still_exits(self):
+        """用户显式 pattern 无匹配 → 仍报错（约束未满足不能静默 fallback）"""
+        from pdf_extract import extract_pdf
+        with self.assertRaises(SystemExit):
+            extract_pdf(input_path=self.pdf_path,
+                        workdir=str(Path(self.tmp) / 'work2'),
+                        chapters_mode='pattern', chapter_pattern=r'^Chapter \d+')
+
+    def test_build_chapter_start_split(self):
+        """识图 chapter_start 标记 → build 时切出新章"""
+        try:
+            from pdf_build import build_pdf
+        except ImportError:
+            self.skipTest('需要 ebooklib')
+        # 模拟识图译文：第 2 页标记为新章起始，第 1/3/4 页普通
+        st = {
+            'scan_p001.png': {'title': '封面', 'blocks': [{'p': '书名：测试书'}]},
+            'scan_p002.png': {'title': '第一章', 'chapter_start': True,
+                              'chapter_title': '第一章 开始', 'blocks': [{'p': '第一章内容'}]},
+            'scan_p003.png': {'title': '正文', 'blocks': [{'p': '第一章续页'}]},
+            'scan_p004.png': {'title': '正文', 'blocks': [{'p': '封底'}]},
+        }
+        json.dump(st, open(self.workdir / 'scan_translations.json', 'w', encoding='utf-8'))
+        meta = dict(self.meta)
+        meta['output'] = str(Path(self.tmp) / 'scanned_out.epub')
+        build_pdf(meta, [], str(self.workdir))
+        md = open(Path(self.tmp) / 'scanned_out.md', encoding='utf-8').read()
+        # 章节标题重建：book 章 + chapter_start 切出的新章
+        self.assertIn('## scanned', md)
+        self.assertIn('## 第一章 开始', md)
+        self.assertIn('第一章内容', md)
+        # EPUB 章节数：1（book 剩余部分）+ 1（新章）= 2
+        import zipfile
+        with zipfile.ZipFile(meta['output']) as z:
+            xhtml = [n for n in z.namelist() if n.endswith('.xhtml') and 'nav' not in n]
+        self.assertEqual(len(xhtml), 2, f'应切出 2 个 XHTML，实际: {xhtml}')
+
+
 if __name__ == '__main__':
     unittest.main(verbosity=2)
